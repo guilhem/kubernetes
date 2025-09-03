@@ -17,6 +17,7 @@ limitations under the License.
 package filters
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -26,7 +27,7 @@ import (
 	"k8s.io/klog/v2"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/audit"
 	"k8s.io/apiserver/pkg/authentication/serviceaccount"
@@ -36,6 +37,22 @@ import (
 	"k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/server/httplog"
 )
+
+// checkImpersonationAuthorization checks if the requestor is authorized to impersonate the target user.
+// For self-impersonation, it first tries with "system:self" user, then falls back to normal authorization.
+func checkImpersonationAuthorization(ctx context.Context, a authorizer.Authorizer, attrs *authorizer.AttributesRecord, requestor user.Info) (authorizer.Decision, string, error) {
+	// For self-impersonation, try "system:self" first
+	if attrs.Resource == "users" && requestor.GetName() == attrs.Name {
+		selfAttrs := *attrs
+		selfAttrs.Name = "system:self"
+
+		if decision, reason, err := a.Authorize(ctx, &selfAttrs); err == nil && decision == authorizer.DecisionAllow {
+			return decision, reason, nil
+		}
+	}
+
+	return a.Authorize(ctx, attrs)
+}
 
 // WithImpersonation is a filter that will inspect and check requests that attempt to change the user.Info for their requests
 func WithImpersonation(handler http.Handler, a authorizer.Authorizer, s runtime.NegotiatedSerializer) http.Handler {
@@ -114,7 +131,8 @@ func WithImpersonation(handler http.Handler, a authorizer.Authorizer, s runtime.
 				return
 			}
 
-			decision, reason, err := a.Authorize(ctx, actingAsAttributes)
+			// Check authorization for impersonation
+			decision, reason, err := checkImpersonationAuthorization(ctx, a, actingAsAttributes, requestor)
 			if err != nil || decision != authorizer.DecisionAllow {
 				klog.V(4).InfoS("Forbidden", "URI", req.RequestURI, "reason", reason, "err", err)
 				responsewriters.Forbidden(ctx, actingAsAttributes, w, req, reason, s)
